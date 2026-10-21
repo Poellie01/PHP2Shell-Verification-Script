@@ -1,0 +1,5 @@
+*.csv
+*.json
+!hosts.txt.example
+hosts.txt
+__pycache__/

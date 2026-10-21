@@ -1,0 +1,5 @@
+# One host per line. '#' starts a comment.
+# Bare hostnames try https:// first, then http://.
+example.com
+shop.example.com
+https://admin.example.com:8443
