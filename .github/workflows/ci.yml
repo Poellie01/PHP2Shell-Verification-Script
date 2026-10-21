@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the major tag of the de-facto standard PHP setup action.
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: Lint PHP
+        run: php -l verify_php2shell.php
+
+      - name: Agent produces valid JSON
+        run: |
+          php verify_php2shell.php --json > out.json
+          php -r 'json_decode(file_get_contents("out.json"), true, 512, JSON_THROW_ON_ERROR); echo "json ok\n";'
+
+      - name: Agent reports this PHP build honestly
+        run: |
+          php verify_php2shell.php --json \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+                print("version", d["php_version"], "patched", d["patched"], d["counts"]); \
+                assert d["script"]=="verify_php2shell"'
+
+      - name: Agent exits non-zero when a check fails
+        run: |
+          set +e
+          php -d session.upload_progress.enabled=1 verify_php2shell.php > /dev/null
+          code=$?
+          set -e
+          echo "exit=$code"
+          test "$code" = "0" -o "$code" = "1"
+
+      - name: Agent integration tests
+        run: python3 -m unittest discover -s tests -v
+
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Byte-compile
+        run: python -m compileall -q php2shell_verify.py scan_logs.py tests
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI smoke
+        run: |
+          python php2shell_verify.py --help > /dev/null
+          python php2shell_verify.py --version
+          python scan_logs.py --help > /dev/null
+          python scan_logs.py --version
+
+      - name: Nagios mode exit codes
+        run: |
+          set +e
+          python php2shell_verify.py -u 127.0.0.1:1 --nagios --timeout 2 --retries 0
+          echo "nagios exit=$?"
+          set -e
+
+  hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No committed access token
+        run: |
+          grep -q "^const ACCESS_TOKEN = '';" verify_php2shell.php \
+            || { echo "ACCESS_TOKEN must be empty in the committed agent"; exit 1; }
+
+      - name: No exploit payloads committed
+        run: |
+          # This repository is verification-only. Fail if attack payloads appear.
+          if grep -rniE "PHP_SESSION_UPLOAD_PROGRESS|multipart/form-data; boundary|R:1500|__destruct" \
+               --include='*.py' --include='*.php' . ; then
+            echo "exploit-shaped content found; this repo is verification-only"
+            exit 1
+          fi
+          echo "clean"
+
+      - name: Fixed versions agree across files
+        run: |
+          for f in README.md php2shell_verify.py verify_php2shell.php; do
+            for v in 8.2.35 8.3.36 8.4.27 8.5.12; do
+              grep -q "$v" "$f" || { echo "$f missing $v"; exit 1; }
+            done
+          done
+          echo "fixed versions consistent"

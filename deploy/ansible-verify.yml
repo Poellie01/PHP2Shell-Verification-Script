@@ -1,0 +1,92 @@
+---
+# Run the php2shell verifier across a fleet with Ansible.
+#
+# Nothing is written to the remote filesystem: the agent is piped to the remote
+# php binary on stdin, exactly as `php2shell_verify.py --ssh` does.
+#
+#   ansible-playbook -i inventory deploy/ansible-verify.yml
+#   ansible-playbook -i inventory deploy/ansible-verify.yml -e php_bin=/usr/bin/php8.2
+#
+# Results land in ./php2shell-results/<host>.json, then the play prints a
+# one-line verdict per host. Exit status is non-zero if any host is unpatched.
+#
+# Author: Poellie -- https://github.com/Poellie01
+
+- name: Verify PHP hosts against CVE-2026-109618 / CVE-2026-109619
+  hosts: all
+  gather_facts: false
+  become: false
+
+  vars:
+    agent_file: "{{ playbook_dir }}/../verify_php2shell.php"
+    php_bin: php
+    results_dir: "{{ playbook_dir }}/../php2shell-results"
+    docroot: ""
+
+  tasks:
+    - name: Ensure the agent exists locally
+      ansible.builtin.stat:
+        path: "{{ agent_file }}"
+      delegate_to: localhost
+      run_once: true
+      register: agent_stat
+      failed_when: not agent_stat.stat.exists
+
+    - name: Create the results directory
+      ansible.builtin.file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Run the verifier from stdin (writes nothing remotely)
+      ansible.builtin.command:
+        argv:
+          - "{{ php_bin }}"
+          - "--"
+          - "--json"
+        stdin: "{{ lookup('file', agent_file) }}"
+      register: verify
+      changed_when: false
+      failed_when: verify.rc not in [0, 1]
+
+    - name: Parse the result
+      ansible.builtin.set_fact:
+        php2shell: "{{ verify.stdout | from_json }}"
+
+    - name: Save the per-host JSON
+      ansible.builtin.copy:
+        content: "{{ verify.stdout }}"
+        dest: "{{ results_dir }}/{{ inventory_hostname }}.json"
+        mode: "0640"
+      delegate_to: localhost
+      changed_when: true
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: PHP {{ php2shell.php_version }}
+          ({{ php2shell.sapi }}) --
+          {{ 'PATCHED' if php2shell.patched
+             else ('UNPATCHED' if php2shell.patched is false else 'PATCH STATUS UNKNOWN') }},
+          {{ php2shell.counts.FAIL }} FAIL /
+          {{ php2shell.counts.WARN }} WARN /
+          {{ php2shell.counts.UNKNOWN }} UNKNOWN
+
+    - name: List failing checks
+      ansible.builtin.debug:
+        msg: "{{ php2shell.checks | selectattr('status', 'equalto', 'FAIL')
+                 | map(attribute='title') | list }}"
+      when: php2shell.counts.FAIL | int > 0
+
+    - name: Fail the play for unpatched hosts
+      ansible.builtin.assert:
+        that:
+          - php2shell.patched is true
+        fail_msg: >-
+          {{ inventory_hostname }} is running PHP {{ php2shell.php_version }},
+          which is not patched for CVE-2026-109618 / CVE-2026-109619.
+          Update to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 and restart all workers.
+        success_msg: "{{ inventory_hostname }} is patched."
+      when: php2shell.patched is not none

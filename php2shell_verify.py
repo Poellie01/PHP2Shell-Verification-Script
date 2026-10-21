@@ -7,46 +7,51 @@ php2shell_verify — check hosts against the PHP advisories of 2026-10-21.
 
 Fixed in PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12.
 
-Two modes:
+Three modes, in increasing order of confidence:
 
   REMOTE (default) -- read-only HTTP. Determines the PHP patch level when the
   host exposes it (X-Powered-By, or a leftover phpinfo with --probe). Sends no
-  payloads and attempts no exploitation. Safe against production you do not
-  operate. Honest limitation: nothing else in these advisories is remotely
-  observable, so hosts that hide their version come back UNKNOWN.
+  payloads and attempts no exploitation. Honest limitation: nothing else in
+  these advisories is remotely observable, so hosts that hide their version
+  come back UNKNOWN.
 
-  AGENT (--token) -- fetches verify_php2shell.php from each host and reports its
-  full advisory check results. Deploy that file on each host, set its
-  ACCESS_TOKEN, and this becomes an authoritative fleet-wide verification
-  instead of a fingerprint.
+  AGENT (--token) -- fetches verify_php2shell.php over HTTP from each host and
+  reports its full advisory check results.
+
+  SSH (--ssh) -- pipes verify_php2shell.php to each host over SSH and runs it
+  there. Nothing is written to the remote filesystem, so there is no file in a
+  document root to remember to delete. Preferred when you have shell access.
 
 Usage:
   php2shell_verify.py -u example.com
   php2shell_verify.py -u a.example.com -u b.example.com --probe
   php2shell_verify.py -f hosts.txt --csv report.csv
-  php2shell_verify.py -f hosts.txt --token YOUR_TOKEN        # authoritative
-  php2shell_verify.py -f hosts.txt --fixed 8.6=8.6.1         # new branch
+  php2shell_verify.py -f hosts.txt --token YOUR_TOKEN
+  php2shell_verify.py -f hosts.txt --ssh
+  php2shell_verify.py -u example.com --nagios
 
-Exit codes: 0 = nothing vulnerable, 1 = at least one VULNERABLE, 2 = usage error.
+Exit codes: 0 = nothing vulnerable, 1 = at least one VULNERABLE, 2 = usage
+error. With --nagios: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
 
 Author: Poellie -- https://github.com/Poellie01
 License: MIT
 """
 import argparse
+import base64
 import concurrent.futures
 import csv
 import json
 import os
 import re
 import ssl
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
-AUTHOR = "Poellie"
-AUTHOR_URL = "https://github.com/Poellie01"
+__version__ = "1.1.0"
 
 BANNER = r"""
  ___          _ _ _
@@ -63,8 +68,8 @@ FIXED = {
     (8, 5): (8, 5, 12),
 }
 # Branches the PHP project no longer updates, but for which minimal source
-# backports were published and distributions/LTS vendors ship their own.
-# A version string on these branches cannot tell you whether a fix is applied.
+# backports were published and distributions/LTS vendors ship their own. A
+# version string on these branches cannot tell you whether a fix is applied.
 BACKPORT_EOL = {(7, 4), (8, 0), (8, 1)}
 
 PROBE_PATHS = ["/phpinfo.php", "/info.php", "/php.php", "/test.php",
@@ -82,6 +87,7 @@ PHPINFO_KEYS = [
 UA = ("php2shell_verify/%s (read-only advisory configuration check; "
       "no payloads sent)" % __version__)
 MAX_BODY = 1024 * 1024
+DEFAULT_AGENT = "verify_php2shell.php"
 
 V_VULNERABLE = "VULNERABLE"
 V_PATCHED = "PATCHED"
@@ -92,9 +98,10 @@ V_UNREACHABLE = "UNREACHABLE"
 SORT_ORDER = {V_VULNERABLE: 0, V_VENDOR: 1, V_UNKNOWN: 2, V_UNREACHABLE: 3, V_PATCHED: 4}
 
 _ver_re = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_branch_re = re.compile(r"(\d+)\.(\d+)")
 _row_re = re.compile(
     r'<tr>\s*<td class="e">\s*([^<]+?)\s*</td>\s*<td class="v">\s*(.*?)\s*</td>', re.S)
-_h1_re = re.compile(r"PHP Version\s*([0-9]+\.[0-9]+\.[0-9]+[^\s<]*)")
+_h1_re = re.compile(r"PHP Version\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?[^\s<]*)")
 _tag_re = re.compile(r"<[^>]+>")
 
 COLOURS = {V_VULNERABLE: "\033[31m", V_PATCHED: "\033[32m", V_VENDOR: "\033[33m",
@@ -109,6 +116,15 @@ def colourise(text, key, enabled):
     return COLOURS[key] + text + "\033[0m"
 
 
+def blank_result(target):
+    return {
+        "target": target, "url": None, "verdict": V_UNREACHABLE, "detail": "",
+        "php_version": None, "branch": None, "source": None, "server": None,
+        "sapi": None, "sapi_hint": "", "mode": "remote", "config": {},
+        "phpinfo_url": None, "agent_counts": None, "agent_items": [], "notes": [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -120,21 +136,47 @@ def ssl_context(verify):
     return ctx
 
 
-def fetch(url, timeout, verify):
-    """GET url -> (status, lowercased headers, body text). Raises on transport error."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context(verify)) as r:
-            body = r.read(MAX_BODY).decode("utf-8", "replace")
-            return r.status, {k.lower(): v for k, v in r.headers.items()}, body
-    except urllib.error.HTTPError as e:
-        body = e.read(MAX_BODY).decode("utf-8", "replace")
-        hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
-        return e.code, hdrs, body
+def build_headers(args):
+    headers = {"User-Agent": UA}
+    for raw in args.header or []:
+        if ":" not in raw:
+            raise ValueError("bad --header %r (want 'Name: value')" % raw)
+        name, value = raw.split(":", 1)
+        headers[name.strip()] = value.strip()
+    if args.basic_auth:
+        if ":" not in args.basic_auth:
+            raise ValueError("bad --basic-auth (want 'user:password')")
+        token = base64.b64encode(args.basic_auth.encode()).decode()
+        headers["Authorization"] = "Basic " + token
+    return headers
+
+
+def fetch(url, args):
+    """GET url -> (status, lowercased headers, body). Retries transport errors."""
+    attempts = max(1, args.retries + 1)
+    last = None
+    for attempt in range(attempts):
+        if args.delay and attempt > 0:
+            time.sleep(args.delay)
+        req = urllib.request.Request(url, headers=args._headers, method="GET")
+        try:
+            with urllib.request.urlopen(
+                    req, timeout=args.timeout, context=ssl_context(not args.insecure)) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, \
+                    r.read(MAX_BODY).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            # A status code is a real answer, not a transport failure.
+            return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, \
+                e.read(MAX_BODY).decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001 - transport errors are retried
+            last = e
+            if attempt + 1 < attempts:
+                time.sleep(min(2.0 * (attempt + 1), 5.0))
+    raise last
 
 
 def normalise(target):
-    """Turn a bare host into candidate URLs, preserving an explicit scheme."""
+    """Candidate URLs for a target, preserving an explicit scheme."""
     target = target.strip()
     if "://" in target:
         return [target]
@@ -149,45 +191,57 @@ def parse_version(text):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def parse_branch(text):
+    """Branch from a possibly truncated version such as 'PHP/8.4'."""
+    m = _branch_re.search(text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def version_from_headers(hdrs):
+    """-> (full version or None, branch or None)"""
     pb = hdrs.get("x-powered-by", "")
-    if "php" in pb.lower():
-        v = parse_version(pb)
-        if v:
-            return v
-    return None
+    if "php" not in pb.lower():
+        return None, None
+    return parse_version(pb), parse_branch(pb)
 
 
 def parse_phpinfo(body):
-    """Return (version, {directive: local value}) if body looks like phpinfo."""
     if "phpinfo()" not in body and "PHP Version" not in body:
-        return None, {}
-    version = None
+        return None, None, {}
+    version = branch = None
     m = _h1_re.search(body)
     if m:
-        version = parse_version(m.group(1))
+        version, branch = parse_version(m.group(1)), parse_branch(m.group(1))
     directives = {}
     for name, value in _row_re.findall(body):
         if name in PHPINFO_KEYS:
             directives[name] = _tag_re.sub("", value).strip() or "(empty)"
-    return version, directives
+    return version, branch, directives
 
 
-def classify(version, fixed):
-    """-> (verdict, detail)"""
+def classify(version, fixed, branch=None):
+    """-> (verdict, detail). `branch` is used when only a partial version leaked."""
     if version is None:
+        if branch and branch in fixed:
+            t = fixed[branch]
+            return V_UNKNOWN, ("branch %d.%d exposed but not the patch level; needs >= "
+                               "%d.%d.%d" % (branch + t))
+        if branch and branch in BACKPORT_EOL:
+            return V_VENDOR, "branch %d.%d is EOL upstream; backports exist" % branch
+        if branch:
+            return V_UNKNOWN, "branch %d.%d exposed but not the patch level" % branch
         return V_UNKNOWN, "PHP version not exposed"
-    branch = version[:2]
-    if branch in fixed:
-        target = fixed[branch]
-        if version >= target:
-            return V_PATCHED, "%d.%d.%d >= %d.%d.%d" % (version + target)
-        return V_VULNERABLE, "%d.%d.%d < %d.%d.%d" % (version + target)
-    if branch in BACKPORT_EOL:
-        return V_VENDOR, "branch %d.%d is EOL upstream; backports exist" % branch
-    if branch < (7, 4):
-        return V_VULNERABLE, "branch %d.%d long out of support" % branch
-    return V_UNKNOWN, "branch %d.%d not in fixed-version table" % branch
+    b = version[:2]
+    if b in fixed:
+        t = fixed[b]
+        if version >= t:
+            return V_PATCHED, "%d.%d.%d >= %d.%d.%d" % (version + t)
+        return V_VULNERABLE, "%d.%d.%d < %d.%d.%d" % (version + t)
+    if b in BACKPORT_EOL:
+        return V_VENDOR, "branch %d.%d is EOL upstream; backports exist" % b
+    if b < (7, 4):
+        return V_VULNERABLE, "branch %d.%d long out of support" % b
+    return V_UNKNOWN, "branch %d.%d not in fixed-version table" % b
 
 
 def sapi_hint(hdrs):
@@ -206,14 +260,36 @@ def sapi_hint(hdrs):
 
 
 # ---------------------------------------------------------------------------
-# Per-host checks
+# Agent result handling (shared by HTTP agent mode and SSH mode)
 # ---------------------------------------------------------------------------
-def agent_check(base, token, agent_path, timeout, verify):
-    """Fetch the on-host PHP verifier's JSON. -> dict or None."""
-    qs = urllib.parse.urlencode({"token": token, "json": "1"})
-    url = base + agent_path + "?" + qs
+def is_agent_payload(data):
+    return isinstance(data, dict) and data.get("script") == "verify_php2shell"
+
+
+def apply_agent(res, data, mode, source):
+    res["mode"] = mode
+    res["source"] = source
+    res["php_version"] = parse_version(data.get("php_version", ""))
+    res["branch"] = parse_branch(data.get("branch") or data.get("php_version", ""))
+    res["sapi"] = data.get("sapi")
+    res["agent_counts"] = data.get("counts") or {}
+    patched = data.get("patched")
+    res["verdict"] = V_PATCHED if patched is True else \
+        V_VULNERABLE if patched is False else V_VENDOR
+    res["agent_items"] = [(c["status"], c.get("title", ""))
+                          for c in data.get("checks", [])
+                          if c.get("status") in ("FAIL", "WARN")]
+    c = res["agent_counts"]
+    res["detail"] = "agent: %d FAIL, %d WARN, %d UNKNOWN" % (
+        c.get("FAIL", 0), c.get("WARN", 0), c.get("UNKNOWN", 0))
+    return res
+
+
+def agent_over_http(base, args):
+    url = base + args.agent_path + "?" + urllib.parse.urlencode(
+        {"token": args.token, "json": "1"})
     try:
-        status, _, body = fetch(url, timeout, verify)
+        status, _, body = fetch(url, args)
     except Exception:
         return None
     if status != 200:
@@ -222,27 +298,69 @@ def agent_check(base, token, agent_path, timeout, verify):
         data = json.loads(body)
     except ValueError:
         return None
-    return data if isinstance(data, dict) and data.get("script") == "verify_php2shell" else None
+    return data if is_agent_payload(data) else None
 
 
-def check_host(target, args, fixed):
-    res = {
-        "target": target, "url": None, "verdict": V_UNREACHABLE, "detail": "",
-        "php_version": None, "source": None, "server": None, "sapi": None,
-        "sapi_hint": "", "mode": "remote", "config": {}, "phpinfo_url": None,
-        "agent_counts": None, "agent_items": [], "notes": [],
-    }
+def agent_over_ssh(target, args, script):
+    """Pipe the agent to the host and run it. Nothing is written remotely."""
+    dest = target
+    for prefix in ("ssh://", "https://", "http://"):
+        if dest.startswith(prefix):
+            dest = dest[len(prefix):]
+    dest = dest.split("/", 1)[0]
+    if args.ssh_user and "@" not in dest:
+        dest = args.ssh_user + "@" + dest
 
-    base, hdrs = None, {}
-    errors = []
+    cmd = ["ssh", "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=%d" % max(1, int(args.timeout))]
+    for opt in args.ssh_opt or []:
+        cmd += ["-o", opt]
+    remote = "%s -- --json" % args.ssh_php
+    if args.docroot:
+        remote += " --docroot=%s" % args.docroot
+    cmd += [dest, remote]
+
+    try:
+        proc = subprocess.run(cmd, input=script, capture_output=True,
+                              timeout=max(15.0, args.timeout * 3))
+    except subprocess.TimeoutExpired:
+        return None, "ssh timed out"
+    except FileNotFoundError:
+        return None, "ssh client not found"
+    if proc.returncode not in (0, 1):
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return None, "ssh failed: " + (err[-1] if err else "exit %d" % proc.returncode)
+    try:
+        data = json.loads((proc.stdout or b"").decode("utf-8", "replace"))
+    except ValueError:
+        return None, "remote output was not the agent's JSON (is php installed?)"
+    if not is_agent_payload(data):
+        return None, "unexpected remote payload"
+    return data, None
+
+
+# ---------------------------------------------------------------------------
+# Per-host check
+# ---------------------------------------------------------------------------
+def check_host(target, args, fixed, script=None):
+    res = blank_result(target)
+
+    # SSH mode bypasses HTTP entirely.
+    if args.ssh:
+        data, err = agent_over_ssh(target, args, script)
+        if data:
+            return apply_agent(res, data, "ssh", "verify_php2shell.php over ssh")
+        res["detail"] = err or "ssh collection failed"
+        return res
+
+    base, hdrs, errors = None, {}, []
     for url in normalise(target):
         try:
-            _, hdrs, _ = fetch(url, args.timeout, not args.insecure)
+            _, hdrs, _ = fetch(url, args)
         except Exception as e:
             errors.append("%s: %s" % (url, type(e).__name__))
             continue
-        base = url.rstrip("/")
-        res["url"] = url
+        base, res["url"] = url.rstrip("/"), url
         res["server"] = hdrs.get("server")
         break
 
@@ -252,78 +370,64 @@ def check_host(target, args, fixed):
 
     res["sapi_hint"] = sapi_hint(hdrs)
 
-    # Authoritative path: the on-host agent.
     if args.token:
-        data = agent_check(base, args.token, args.agent_path, args.timeout, not args.insecure)
+        data = agent_over_http(base, args)
         if data:
-            res["mode"] = "agent"
-            res["php_version"] = parse_version(data.get("php_version", ""))
-            res["source"] = "verify_php2shell.php"
-            res["sapi"] = data.get("sapi")
-            res["agent_counts"] = data.get("counts")
-            patched = data.get("patched")
-            if patched is True:
-                res["verdict"] = V_PATCHED
-            elif patched is False:
-                res["verdict"] = V_VULNERABLE
-            else:
-                res["verdict"] = V_VENDOR
-            for c in data.get("checks", []):
-                if c.get("status") in ("FAIL", "WARN"):
-                    res["agent_items"].append((c["status"], c.get("title", "")))
-            counts = res["agent_counts"] or {}
-            res["detail"] = "agent: %d FAIL, %d WARN, %d UNKNOWN" % (
-                counts.get("FAIL", 0), counts.get("WARN", 0), counts.get("UNKNOWN", 0))
-            return res
+            return apply_agent(res, data, "agent", "verify_php2shell.php over http")
         res["notes"].append("agent not reachable at %s -- fell back to remote fingerprint "
                             "(not deployed, wrong token, or blocked)" % args.agent_path)
 
-    # Remote fingerprint.
-    version = version_from_headers(hdrs)
-    if version:
-        res["php_version"], res["source"] = version, "X-Powered-By"
+    version, branch = version_from_headers(hdrs)
+    if version or branch:
+        res["php_version"], res["branch"] = version, branch
+        res["source"] = "X-Powered-By"
 
     if args.probe:
         for path in PROBE_PATHS:
             try:
-                status, phdrs, body = fetch(base + path, args.timeout, not args.insecure)
+                status, phdrs, body = fetch(base + path, args)
             except Exception:
                 continue
             if res["php_version"] is None:
-                v = version_from_headers(phdrs)
-                if v:
-                    res["php_version"], res["source"] = v, "X-Powered-By on " + path
+                v, b = version_from_headers(phdrs)
+                if v or b:
+                    res["php_version"], res["branch"] = v, b or res["branch"]
+                    res["source"] = "X-Powered-By on " + path
             if status != 200:
                 continue
-            pv, directives = parse_phpinfo(body)
-            if pv or directives:
+            pv, pb, directives = parse_phpinfo(body)
+            if pv or pb or directives:
                 res["phpinfo_url"] = base + path
                 res["notes"].append("publicly reachable phpinfo at %s -- a finding in its own "
                                     "right, remove it" % path)
                 if pv:
                     res["php_version"], res["source"] = pv, "phpinfo at " + path
+                if pb:
+                    res["branch"] = pb
                 res["config"] = directives
                 break
+            if args.delay:
+                time.sleep(args.delay)
 
-    res["verdict"], res["detail"] = classify(res["php_version"], fixed)
+    res["verdict"], res["detail"] = classify(res["php_version"], fixed, res["branch"])
 
     cfg = res["config"]
     up = cfg.get("session.upload_progress.enabled", "")
     if up:
         if up.lower() in ("on", "1"):
-            res["notes"].append("session.upload_progress.enabled=On -- the 109619 consumer used in "
-                                "the RCE confirmed against both mod_php and FPM")
+            res["notes"].append("session.upload_progress.enabled=On -- the 109619 consumer used "
+                                "in the RCE confirmed against both mod_php and FPM")
         else:
-            res["notes"].append("session.upload_progress.enabled=%s -- demonstrated 109619 session "
-                                "path closed" % up)
+            res["notes"].append("session.upload_progress.enabled=%s -- demonstrated 109619 "
+                                "session path closed" % up)
     ml = cfg.get("memory_limit", "")
     if ml and ml.strip() != "-1":
         res["notes"].append("memory_limit=%s -- not -1, so the predictable per-request limit the "
                             "109618 exploit relies on is present" % ml)
     feb = cfg.get("fatal_error_backtraces", "")
-    if feb and feb.lower() in ("on", "1") and res["php_version"] and res["php_version"][:2] == (8, 5):
-        res["notes"].append("fatal_error_backtraces=On on 8.5 -- the advisory's strongest confirmed "
-                            "109619 producer")
+    if feb and feb.lower() in ("on", "1") and res["branch"] == (8, 5):
+        res["notes"].append("fatal_error_backtraces=On on 8.5 -- the advisory's strongest "
+                            "confirmed 109619 producer")
     return res
 
 
@@ -334,14 +438,20 @@ def vstr(v):
     return "%d.%d.%d" % v if v else "-"
 
 
+def tally(results):
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    return counts
+
+
 def print_report(results, args, colour):
     width = max([len(r["target"]) for r in results] + [6])
     print("%-*s  %-12s  %-9s  %s" % (width, "HOST", "VERDICT", "PHP", "DETAIL"))
     print("-" * min(110, width + 42))
     for r in results:
         print("%-*s  %s  %-9s  %s" % (
-            width, r["target"],
-            colourise("%-12s" % r["verdict"], r["verdict"], colour),
+            width, r["target"], colourise("%-12s" % r["verdict"], r["verdict"], colour),
             vstr(r["php_version"]), r["detail"]))
         if r["source"]:
             print("%*s    source: %s%s" % (width, "", r["source"],
@@ -356,53 +466,86 @@ def print_report(results, args, colour):
         for note in r["notes"]:
             print("%*s    ! %s" % (width, "", note))
 
-    counts = {}
-    for r in results:
-        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    counts = tally(results)
     print()
     print("Summary: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))
 
-    vuln = [r["target"] for r in results if r["verdict"] == V_VULNERABLE]
-    vendor = [r["target"] for r in results if r["verdict"] == V_VENDOR]
-    unknown = [r["target"] for r in results
-               if r["verdict"] in (V_UNKNOWN, V_UNREACHABLE)]
+    groups = [
+        (V_VULNERABLE, "VULNERABLE -- update to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 and restart "
+                       "all workers:"),
+        (V_VENDOR, "VENDOR-CHECK -- EOL branch; a backport may be applied without changing the\n"
+                   "version string. Confirm against the package changelog before trusting:"),
+    ]
+    for verdict, heading in groups:
+        hosts = [r["target"] for r in results if r["verdict"] == verdict]
+        if hosts:
+            print("\n" + heading)
+            for h in hosts:
+                print("  - " + h)
 
-    if vuln:
-        print("\nVULNERABLE -- update to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 and restart all workers:")
-        for t in vuln:
-            print("  - " + t)
-    if vendor:
-        print("\nVENDOR-CHECK -- EOL branch; a backport may be applied without changing the version")
-        print("string. Confirm against the package changelog before trusting:")
-        for t in vendor:
-            print("  - " + t)
+    unknown = [r["target"] for r in results if r["verdict"] in (V_UNKNOWN, V_UNREACHABLE)]
     if unknown:
-        print("\nNo remote answer for %d host(s) -- the version is not exposed:" % len(unknown))
-        for t in unknown:
-            print("  - " + t)
-        if not args.token:
-            print("Deploy verify_php2shell.php on these hosts and re-run with --token for an")
-            print("authoritative result, or ask whoever operates them for 'php -v' output.")
+        print("\nNo answer for %d host(s):" % len(unknown))
+        for h in unknown:
+            print("  - " + h)
+        if not (args.token or args.ssh):
+            print("Use --ssh if you have shell access (nothing is written remotely), or deploy")
+            print("verify_php2shell.php and use --token, or ask whoever operates them for 'php -v'.")
 
-    if args.token:
-        agents = sum(1 for r in results if r["mode"] == "agent")
-        print("\nAgent mode: %d of %d host(s) answered on %s."
-              % (agents, len(results), args.agent_path))
+    if args.ssh:
+        n = sum(1 for r in results if r["mode"] == "ssh")
+        print("\nSSH mode: %d of %d host(s) answered." % (n, len(results)))
+    elif args.token:
+        n = sum(1 for r in results if r["mode"] == "agent")
+        print("\nAgent mode: %d of %d host(s) answered on %s." % (n, len(results), args.agent_path))
     else:
         print("\nRemote mode reports PHP patch level only. session.upload_progress.enabled,")
         print("memory_limit, fatal_error_backtraces and .user.ini overrides are not remotely")
-        print("observable -- use --token with verify_php2shell.php deployed to check those.")
+        print("observable -- use --ssh or --token to check those.")
+
+
+def print_nagios(results):
+    """Single-line Nagios/Icinga output. Returns the plugin exit code."""
+    counts = tally(results)
+    total = len(results)
+    vuln = counts.get(V_VULNERABLE, 0)
+    vendor = counts.get(V_VENDOR, 0)
+    unknown = counts.get(V_UNKNOWN, 0) + counts.get(V_UNREACHABLE, 0)
+    patched = counts.get(V_PATCHED, 0)
+    perf = ("vulnerable=%d;;;0 vendor_check=%d patched=%d unknown=%d hosts=%d"
+            % (vuln, vendor, patched, unknown, total))
+
+    if vuln:
+        state, code = "CRITICAL", 2
+        msg = "%d of %d host(s) unpatched for CVE-2026-109618/109619" % (vuln, total)
+    elif vendor:
+        state, code = "WARNING", 1
+        msg = "%d host(s) on EOL branches need vendor confirmation" % vendor
+    elif patched == 0:
+        state, code = "UNKNOWN", 3
+        msg = "no host returned a usable PHP version"
+    elif unknown:
+        state, code = "WARNING", 1
+        msg = "%d of %d host(s) patched, %d unverifiable" % (patched, total, unknown)
+    else:
+        state, code = "OK", 0
+        msg = "all %d host(s) patched" % total
+
+    print("PHP2SHELL %s - %s | %s" % (state, msg, perf))
+    return code
 
 
 def write_csv(path, results):
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["host", "verdict", "php_version", "detail", "mode", "source",
-                    "server", "sapi", "phpinfo_url", "notes"])
+                    "server", "sapi", "phpinfo_url", "agent_fail", "agent_warn", "notes"])
         for r in results:
+            c = r["agent_counts"] or {}
             w.writerow([r["target"], r["verdict"], vstr(r["php_version"]), r["detail"],
                         r["mode"], r["source"] or "", r["server"] or "", r["sapi"] or "",
-                        r["phpinfo_url"] or "", " | ".join(r["notes"])])
+                        r["phpinfo_url"] or "", c.get("FAIL", ""), c.get("WARN", ""),
+                        " | ".join(r["notes"])])
 
 
 def parse_fixed_override(spec):
@@ -422,34 +565,83 @@ def parse_fixed_override(spec):
     return out
 
 
-def main():
+def load_agent_script(args, parser):
+    path = args.agent_file or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), DEFAULT_AGENT)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        parser.error("--ssh needs %s: %s" % (DEFAULT_AGENT, e))
+    if b"verify_php2shell" not in data:
+        parser.error("%s does not look like the agent script" % path)
+    return data
+
+
+def build_parser():
     p = argparse.ArgumentParser(
         prog="php2shell_verify.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Check hosts against CVE-2026-109618 / CVE-2026-109619.",
         epilog="Read-only: sends no payloads and attempts no exploitation.")
-    p.add_argument("-u", "--url", action="append", default=[], metavar="HOST",
+
+    t = p.add_argument_group("targets")
+    t.add_argument("-u", "--url", action="append", default=[], metavar="HOST",
                    help="host or URL to check; repeatable")
-    p.add_argument("-f", "--file", metavar="PATH",
+    t.add_argument("-f", "--file", metavar="PATH",
                    help="file of hosts, one per line ('#' comments allowed)")
-    p.add_argument("positional", nargs="*", metavar="HOST",
+    t.add_argument("positional", nargs="*", metavar="HOST",
                    help="hosts may also be given positionally")
-    p.add_argument("--token", metavar="TOKEN",
-                   help="ACCESS_TOKEN of verify_php2shell.php; enables authoritative agent mode")
-    p.add_argument("--agent-path", default="/verify_php2shell.php", metavar="PATH",
-                   help="path to the deployed verifier (default: %(default)s)")
-    p.add_argument("--probe", action="store_true",
+
+    a = p.add_argument_group("authoritative collection")
+    a.add_argument("--token", metavar="TOKEN",
+                   help="ACCESS_TOKEN of a deployed verify_php2shell.php (HTTP agent mode)")
+    a.add_argument("--agent-path", default="/verify_php2shell.php", metavar="PATH",
+                   help="URL path of the deployed agent (default: %(default)s)")
+    a.add_argument("--ssh", action="store_true",
+                   help="run the agent over SSH instead; writes nothing to the remote host")
+    a.add_argument("--ssh-user", metavar="USER", help="SSH user when a target has no 'user@'")
+    a.add_argument("--ssh-php", default="php", metavar="CMD",
+                   help="remote PHP binary (default: %(default)s)")
+    a.add_argument("--ssh-opt", action="append", metavar="OPT",
+                   help="extra ssh -o option; repeatable")
+    a.add_argument("--agent-file", metavar="PATH",
+                   help="path to verify_php2shell.php (default: next to this script)")
+    a.add_argument("--docroot", metavar="PATH",
+                   help="document root to scan for .user.ini overrides (SSH mode)")
+
+    h = p.add_argument_group("http")
+    h.add_argument("--probe", action="store_true",
                    help="also look for a leftover phpinfo page to read the real config "
                         "(off by default: it looks like scanning in access logs)")
-    p.add_argument("--timeout", type=float, default=10.0, metavar="SEC")
-    p.add_argument("--workers", type=int, default=8, metavar="N")
-    p.add_argument("--insecure", action="store_true", help="do not verify TLS certificates")
-    p.add_argument("--fixed", metavar="SPEC",
+    h.add_argument("--header", action="append", metavar="'K: V'",
+                   help="extra request header; repeatable")
+    h.add_argument("--basic-auth", metavar="USER:PASS", help="HTTP basic auth credentials")
+    h.add_argument("--timeout", type=float, default=10.0, metavar="SEC",
+                   help="per-request timeout (default: %(default)s)")
+    h.add_argument("--retries", type=int, default=1, metavar="N",
+                   help="retries after a transport error (default: %(default)s)")
+    h.add_argument("--delay", type=float, default=0.0, metavar="SEC",
+                   help="pause between requests to the same host (default: %(default)s)")
+    h.add_argument("--workers", type=int, default=8, metavar="N",
+                   help="hosts checked in parallel (default: %(default)s)")
+    h.add_argument("--insecure", action="store_true", help="do not verify TLS certificates")
+
+    o = p.add_argument_group("output")
+    o.add_argument("--fixed", metavar="SPEC",
                    help="add or override fixed versions, e.g. 8.6=8.6.1")
-    p.add_argument("--json", metavar="PATH", help="write full results as JSON")
-    p.add_argument("--csv", metavar="PATH", help="write a summary CSV")
-    p.add_argument("--no-colour", action="store_true")
-    p.add_argument("--no-banner", action="store_true", help="suppress the banner")
-    p.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
+    o.add_argument("--json", metavar="PATH", help="write full results as JSON")
+    o.add_argument("--csv", metavar="PATH", help="write a summary CSV")
+    o.add_argument("--nagios", action="store_true",
+                   help="single-line Nagios/Icinga output with perfdata and plugin exit codes")
+    o.add_argument("--no-colour", action="store_true")
+    o.add_argument("--no-banner", action="store_true", help="suppress the banner")
+    o.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
+    return p
+
+
+def main():
+    p = build_parser()
     args = p.parse_args()
 
     targets, seen = [], set()
@@ -471,46 +663,57 @@ def main():
         p.error("no hosts given; use -u HOST, positional hosts, or -f FILE")
 
     try:
+        args._headers = build_headers(args)
         fixed = parse_fixed_override(args.fixed) if args.fixed else dict(FIXED)
     except ValueError as e:
         p.error(str(e))
 
-    colour = (not args.no_colour) and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    script = load_agent_script(args, p) if args.ssh else None
+    quiet = args.nagios
+    colour = (not args.no_colour) and not quiet and sys.stdout.isatty() \
+        and os.environ.get("TERM") != "dumb"
 
-    if not args.no_banner:
-        print(BANNER % __version__)
-        print()
-    print("Fixed in PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12 (advisories of 2026-10-21)")
-    print("Mode: %s | %d host(s)\n" % ("agent + remote" if args.token else "remote", len(targets)))
+    if not quiet:
+        if not args.no_banner:
+            print(BANNER % __version__)
+            print()
+        print("Fixed in PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12 (advisories of 2026-10-21)")
+        mode = "ssh" if args.ssh else ("agent + remote" if args.token else "remote")
+        print("Mode: %s | %d host(s)\n" % (mode, len(targets)))
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        futures = {ex.submit(check_host, t, args, fixed): t for t in targets}
+        futures = {ex.submit(check_host, t, args, fixed, script): t for t in targets}
         for fut in concurrent.futures.as_completed(futures):
             t = futures[fut]
             try:
                 results.append(fut.result())
-            except Exception as e:
-                results.append({"target": t, "verdict": V_UNREACHABLE,
-                                "detail": "%s: %s" % (type(e).__name__, e),
-                                "php_version": None, "source": None, "server": None,
-                                "sapi": None, "sapi_hint": "", "mode": "remote",
-                                "config": {}, "phpinfo_url": None, "agent_counts": None,
-                                "agent_items": [], "notes": [], "url": None})
+            except Exception as e:  # noqa: BLE001 - one bad host must not kill the run
+                bad = blank_result(t)
+                bad["detail"] = "%s: %s" % (type(e).__name__, e)
+                results.append(bad)
 
     results.sort(key=lambda r: (SORT_ORDER.get(r["verdict"], 9), r["target"]))
-    print_report(results, args, colour)
+
+    if quiet:
+        code = print_nagios(results)
+    else:
+        print_report(results, args, colour)
+        code = 1 if any(r["verdict"] == V_VULNERABLE for r in results) else 0
 
     if args.json:
-        payload = [dict(r, php_version=vstr(r["php_version"])) for r in results]
         with open(args.json, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        print("\nJSON written to %s" % args.json)
+            json.dump([dict(r, php_version=vstr(r["php_version"]),
+                            branch=("%d.%d" % r["branch"]) if r["branch"] else None)
+                       for r in results], fh, indent=2)
+        if not quiet:
+            print("\nJSON written to %s" % args.json)
     if args.csv:
         write_csv(args.csv, results)
-        print("CSV written to %s" % args.csv)
+        if not quiet:
+            print("CSV written to %s" % args.csv)
 
-    return 1 if any(r["verdict"] == V_VULNERABLE for r in results) else 0
+    return code
 
 
 if __name__ == "__main__":

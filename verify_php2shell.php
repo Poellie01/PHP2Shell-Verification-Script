@@ -36,6 +36,7 @@
 // Web access gate. Empty = CLI only.
 // To allow web use set a long random string, e.g. bin2hex(random_bytes(16)).
 // ---------------------------------------------------------------------------
+const VERSION      = '1.1.0';
 const ACCESS_TOKEN = '';
 
 const FIXED        = ['8.2' => '8.2.35', '8.3' => '8.3.36', '8.4' => '8.4.27', '8.5' => '8.5.12'];
@@ -381,15 +382,31 @@ if ($nest >= 64) {
         'max_input_nesting_level = ' . $nest . ', below the default of 64.', '');
 }
 
-$maxVars    = (int) ini_get('max_input_vars');
-$maxUploads = (int) ini_get('max_file_uploads');
-add(sev($patched, 'WARN'), '109618', 'Input and multipart bounds',
-    'max_input_vars = ' . $maxVars . ', max_file_uploads = ' . $maxUploads . '. Headers per multipart '
-    . 'part are unbounded in PHP, and empty file controls do not count toward max_file_uploads but '
-    . 'still allocate file metadata — both are named OOM triggers.',
-    'Bound the number of input variables, multipart parts, headers per part and uploads at the '
-    . 'frontend or application level. If the application does not use multipart form data, block that '
-    . 'content type at the frontend entirely.');
+$maxVars     = (int) ini_get('max_input_vars');
+$maxUploads  = (int) ini_get('max_file_uploads');
+$permissive  = [];
+if ($maxVars > 1000 || $maxVars === 0) {
+    $permissive[] = 'max_input_vars = ' . ($maxVars === 0 ? '0 (unlimited)' : $maxVars)
+                  . ' (default 1000)';
+}
+if ($maxUploads > 20 || $maxUploads === 0) {
+    $permissive[] = 'max_file_uploads = ' . ($maxUploads === 0 ? '0 (unlimited)' : $maxUploads)
+                  . ' (default 20)';
+}
+$boundsNote = 'Headers per multipart part are unbounded in PHP, and empty file controls do not count '
+            . 'toward max_file_uploads but still allocate file metadata — both are named OOM '
+            . 'triggers that no PHP setting bounds.';
+$boundsFix  = 'Bound the number of input variables, multipart parts, headers per part and uploads at '
+            . 'the frontend or application level. If the application does not use multipart form data, '
+            . 'block that content type at the frontend entirely.';
+if ($permissive) {
+    add(sev($patched, 'WARN'), '109618', 'Input and multipart bounds',
+        'Above default: ' . implode('; ', $permissive) . '. ' . $boundsNote, $boundsFix);
+} else {
+    add('INFO', '109618', 'Input and multipart bounds',
+        'max_input_vars = ' . $maxVars . ', max_file_uploads = ' . $maxUploads
+        . ' — both at or below their defaults. ' . $boundsNote, $boundsFix);
+}
 
 // Address-space rlimits, which the advisory explicitly warns against
 if (@is_readable('/proc/self/limits')) {
@@ -503,9 +520,6 @@ if (version_compare($branch, '8.5', '>=')) {
         $diag[] = 'intl.error_level=' . $iel . ' (nonzero emits a diagnostic on 8.5)';
     }
 }
-if (trim((string) ini_get('date.timezone')) === '') {
-    $diag[] = 'date.timezone is empty';
-}
 $obd = (string) ini_get('open_basedir');
 if ($obd !== '') {
     foreach (['session.save_path' => save_path_dir(ini_get('session.save_path')),
@@ -522,13 +536,18 @@ if ($diag) {
         implode('; ', $diag) . '. Any warning, notice or deprecation raised during early INI application '
         . 'can act as the consumer, even when not displayed or logged.',
         'Remove or correct these. Changing error_reporting, using @, or disabling display_errors or '
-        . 'log_errors does NOT prevent the path.');
+        . 'log_errors does NOT prevent the path. Some emitters cannot be seen from inside a request '
+        . 'at all — an invalid date.timezone, for example, is rewritten to UTC during startup after '
+        . 'the diagnostic is raised — so also check the startup log: '
+        . 'php -i 2>&1 | grep -i \'PHP Startup\'');
 } else {
     add('PASS', '109619', 'Settings that emit pre-init diagnostics',
         'None of the advisory\'s named diagnostic-emitting settings are in a risky state here.',
-        'Not exhaustive — the advisory also lists legacy assert.* (8.3+), legacy session settings '
-        . '(8.4+), invalid zend.assertions or extension values, and malformed quantities. Confirm with '
-        . 'your startup log: php -i 2>&1 | grep -i startup, plus the FPM/Apache error log.');
+        'Not exhaustive, and some emitters are invisible from inside a request: an invalid '
+        . 'date.timezone is rewritten to UTC during startup after the diagnostic is raised. The '
+        . 'advisory also lists legacy assert.* (8.3+), legacy session settings (8.4+), invalid '
+        . 'zend.assertions or extension values, and malformed quantities. Confirm with the startup '
+        . 'log: php -i 2>&1 | grep -i \'PHP Startup\', plus the FPM/Apache error log.');
 }
 
 // Timeouts: a named 109619 producer
@@ -625,6 +644,7 @@ foreach ($CHECKS as $c) {
 if ($WANT_JSON) {
     echo json_encode([
         'script'         => 'verify_php2shell',
+        'version'        => VERSION,
         'author'         => 'Poellie (https://github.com/Poellie01)',
         'generated'      => gmdate('c'),
         'php_version'    => PHP_VERSION,
@@ -661,7 +681,7 @@ out(<<<'ART'
 |_| \___/\___|_|_|_\___|
 ART);
 out();
-out('CVE-2026-109618 (OOM corruption) / CVE-2026-109619 (stale global state)');
+out('v' . VERSION . ' — CVE-2026-109618 (OOM corruption) / CVE-2026-109619 (stale global state)');
 out('Advisories of 2026-10-21. Fixed in 8.2.35, 8.3.36, 8.4.27, 8.5.12.');
 out(str_repeat('=', 82));
 out();

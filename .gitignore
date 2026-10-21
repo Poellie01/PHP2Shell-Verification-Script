@@ -1,5 +1,13 @@
+# Never commit a token-bearing agent copy
+*.configured.php
+verify_php2shell.local.php
+
+# Output
 *.csv
 *.json
 !hosts.txt.example
 hosts.txt
+php2shell-results/
+
 __pycache__/
+*.pyc
